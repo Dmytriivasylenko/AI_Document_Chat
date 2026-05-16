@@ -1,93 +1,75 @@
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
-from typing import List
-from rag_app.rag import llm_answer_stream
-from rag_app.auth_service import get_current_user
-from rag_app.db import get_conn
-from rag_app.rag import embed_texts, llm_answer_stream
+"""
+Chat endpoint — streams LLM answers via Server-Sent Events (SSE).
+"""
+from typing import Annotated, AsyncGenerator
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-import json
+from pydantic import BaseModel
+
+from rag_app.auth_service import get_current_user
+from rag_app.db import get_db
+from rag_app.models import User
+from rag_app.rag import embed_texts_async, llm_answer_stream, search_chunks
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(..., example="Please do summary documents")
+    question: str
+    top_k: int = 5
 
 
-class Source(BaseModel):
-    chunk_id: int
-    document_id: int
-    preview: str
+@router.post(
+    "/",
+    summary="Ask a question across your documents",
+    response_description="Server-Sent Events stream of answer tokens",
+)
+async def chat(
+    body: ChatRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """
+    RAG chat endpoint.
+
+    1. Embeds the question.
+    2. Retrieves the top-k most relevant chunks from the user's documents.
+    3. Streams the GPT answer back as **SSE** (`text/event-stream`).
+
+    Consume with `EventSource` in the browser or `httpx` with streaming enabled.
+    """
+    if not body.question.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Question cannot be empty")
+
+    # 1. Embed question
+    [query_vec] = await embed_texts_async([body.question])
+
+    # 2. Retrieve relevant chunks
+    rows = await search_chunks(db, current_user.id, query_vec, k=body.top_k)
+    if not rows:
+        async def no_docs():
+            yield "data: I don't have any documents to answer from. Please upload a PDF first.\n\n"
+        return StreamingResponse(no_docs(), media_type="text/event-stream")
+
+    # 3. Build context (include source filename for traceability)
+    context_parts = [f"[{row.filename}]\n{row.text}" for row in rows]
+    context = "\n\n---\n\n".join(context_parts)
+
+    # 4. Stream answer
+    return StreamingResponse(
+        _sse_generator(body.question, context),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-class ChatResponse(BaseModel):
-    answer: str
-    sources: List[Source]
-
-
-def search_chunks(user_id: int, query_embedding: list[float], k: int = 5):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT c.id, c.text, c.document_id
-                FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE d.user_id=%s AND d.status='ready'
-                ORDER BY c.embedding <-> %s
-                LIMIT %s
-                """,
-                (user_id, query_embedding, k),
-            )
-            return cur.fetchall()
-
-
-@router.post("", response_model=ChatResponse)
-def chat(req: ChatRequest, user=Depends(get_current_user)):
-    qvec = embed_texts([req.question])[0]
-    rows = search_chunks(user["id"], qvec, k=5)
-
-    context = "\n\n".join([r[1] for r in rows])
-
-    if not context.strip():
-        return {
-            "answer": "Немає контексту. Завантаж PDF і дочекайся статусу ready.",
-            "sources": [],
-        }
-
-    answer = llm_answer_stream(req.question, context)
-
-    sources = [
-        {"chunk_id": r[0], "document_id": r[2], "preview": r[1][:200]}
-        for r in rows
-    ]
-
-    return {"answer": answer, "sources": sources}
-
-@router.post("/stream")
-def chat_stream(req: ChatRequest, user=Depends(get_current_user)):
-    qvec = embed_texts([req.question])[0]
-    rows = search_chunks(user["id"], qvec, k=5)
-    context = "\n\n".join([r[1] for r in rows])
-
-    sources = [
-        {"chunk_id": r[0], "document_id": r[2], "preview": r[1][:200]}
-        for r in rows
-    ]
-
-    def event_generator():
-        if not context.strip():
-            yield "data: " + json.dumps({"type": "token", "value": "No context. Upload PDF and wait until ready."}) + "\n\n"
-            yield "data: " + json.dumps({"type": "done"}) + "\n\n"
-            return
-
-        # stream tokens from OpenAI
-        for token in llm_answer_stream(req.question, context):
-            yield "data: " + json.dumps({"type": "token", "value": token}) + "\n\n"
-
-        # send sources at end
-        yield "data: " + json.dumps({"type": "sources", "value": sources}) + "\n\n"
-        yield "data: " + json.dumps({"type": "done"}) + "\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+async def _sse_generator(question: str, context: str) -> AsyncGenerator[str, None]:
+    """Wrap the LLM token stream in SSE format."""
+    try:
+        async for token in llm_answer_stream(question, context):
+            yield f"data: {token}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        yield f"data: [ERROR] {exc}\n\n"
