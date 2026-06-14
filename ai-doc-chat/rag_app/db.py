@@ -30,7 +30,6 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency that yields an async DB session."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -41,7 +40,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def check_db_connection() -> bool:
-    """Health-check helper — returns True if DB is reachable."""
     try:
         async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))

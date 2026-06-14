@@ -15,24 +15,40 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
-    ports:
-      - "6379:6379"
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   api:
     build: .
     restart: unless-stopped
     command: >
       sh -c "alembic upgrade head &&
-             uvicorn rag_app.main:app --host 0.0.0.0 --port 8000"
+             gunicorn rag_app.main:app
+               -k uvicorn.workers.UvicornWorker
+               -w 2
+               --bind 0.0.0.0:8000
+               --timeout 120
+               --access-logfile -"
     env_file: .env
     ports:
       - "8000:8000"
@@ -41,27 +57,72 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   worker:
     build: .
     restart: unless-stopped
-    command: celery -A rag_app.celery_app worker --loglevel=info --concurrency=4
+    command: >
+      celery -A rag_app.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --max-tasks-per-child=50
     env_file: .env
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A rag_app.celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 1g
 
   flower:
-    build: .
+    image: mher/flower:2.0
     restart: unless-stopped
-    command: celery -A rag_app.celery_app flower --port=5555
-    env_file: .env
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      FLOWER_PORT: 5555
     ports:
       - "5555:5555"
     depends_on:
       - worker
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5555 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+networks:
+  internal:
+    driver: bridge
 
 volumes:
   postgres_data:

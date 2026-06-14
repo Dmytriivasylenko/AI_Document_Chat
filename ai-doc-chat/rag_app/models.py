@@ -3,6 +3,8 @@ SQLAlchemy ORM models.
 
 All timestamps use timezone-aware UTC (datetime.now(UTC)) — datetime.utcnow()
 is deprecated since Python 3.12 and will be removed in a future release.
+
+Embedding dimension: 1024 — matches Voyage AI's voyage-3 model output.
 """
 from datetime import datetime, UTC
 from enum import Enum as PyEnum
@@ -17,7 +19,6 @@ from pgvector.sqlalchemy import Vector
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
 
 class Base(DeclarativeBase):
     pass
@@ -46,6 +47,7 @@ class Document(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     filename = Column(String, nullable=False)
+    file_hash = Column(String(64), nullable=True, index=True)
     status = Column(
         Enum(DocumentStatus, name="document_status"),
         default=DocumentStatus.PROCESSING,
@@ -54,7 +56,6 @@ class Document(Base):
     file_bytes = Column(LargeBinary, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
-
     user = relationship("User", back_populates="documents")
     chunks = relationship("Chunk", back_populates="document", cascade="all, delete-orphan")
 
@@ -65,7 +66,7 @@ class Chunk(Base):
     id = Column(Integer, primary_key=True)
     document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     text = Column(Text, nullable=False)
-    embedding = Column(Vector(1536), nullable=False)
+    embedding = Column(Vector(1024), nullable=False)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     document = relationship("Document", back_populates="chunks")

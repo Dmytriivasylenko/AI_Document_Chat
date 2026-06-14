@@ -1,6 +1,3 @@
-"""
-Authentication helpers: password hashing, JWT creation/validation.
-"""
 import logging
 from datetime import datetime, timedelta, UTC
 from typing import Annotated, Optional
@@ -42,10 +39,7 @@ async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
-    """
-    FastAPI dependency — resolves a Bearer token to the corresponding User row.
-    Raises HTTP 401 on any failure so callers never see raw JWT errors.
-    """
+
     credentials_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
